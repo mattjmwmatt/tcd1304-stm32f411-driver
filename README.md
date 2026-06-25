@@ -1,8 +1,8 @@
 # TCD1304 Driver for STM32F411 (Nucleo-F411RE)
 
-> ⚠️ **Work in Progress — this firmware is NOT complete and has not been fully tested on hardware. Use at your own risk. Contributions and bug reports are welcome.**
+> **Work in Progress — this firmware is NOT complete and has not been fully tested on hardware.**
 
-Bare-metal firmware to drive the **Toshiba TCD1304DG** 3648-element linear CCD
+Firmware to drive the **Toshiba TCD1304DG** 3648-element linear CCD
 image sensor using a **Nucleo-F411RE** board, plus a Python host script to
 acquire and plot spectra.
 
@@ -13,7 +13,6 @@ acquire and plot spectra.
 - [ ] Timing has **not been verified on real hardware** — oscilloscope validation of fM, SH, ICG relationships is required before connecting a sensor
 - [ ] ADC sampling rate alignment with fM needs empirical tuning (currently assumes 4 fM cycles per pixel)
 - [ ] No overflow / saturation detection or warning
-- [ ] No electronic shutter (EOS) support yet
 - [ ] USB CDC not implemented — uses UART over ST-Link bridge only
 - [ ] CMSIS headers must be provided manually (not bundled)
 - [ ] Python script has no reconnect logic on serial errors

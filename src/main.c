@@ -2,8 +2,6 @@
  * @file    main.c
  * @brief   TCD1304 Linear CCD Driver for STM32F411 (Nucleo-F411RE)
  *
- * ⚠️  WORK IN PROGRESS — NOT COMPLETE, NOT HARDWARE-TESTED ⚠️
- *
  * =============================================================================
  * PIN MAPPING (Nucleo-F411RE / STM32F411RE)
  * =============================================================================

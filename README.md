@@ -8,7 +8,7 @@ acquire and plot spectra.
 
 ---
 
-## Known limitations / TODO
+# TODO
 
 - [ ] Timing has **not been verified on real hardware** — oscilloscope validation of fM, SH, ICG relationships is required before connecting a sensor
 - [ ] ADC sampling rate alignment with fM needs empirical tuning (currently assumes 4 fM cycles per pixel)

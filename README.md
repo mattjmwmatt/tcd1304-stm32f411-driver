@@ -1,6 +1,6 @@
 # TCD1304 Driver for STM32F411 (Nucleo-F411RE)
 
-> **Work in Progress — this firmware is NOT complete and has not been fully tested on hardware.**
+> **Work in Progress **
 
 Firmware to drive the **Toshiba TCD1304DG** 3648-element linear CCD
 image sensor using a **Nucleo-F411RE** board, plus a Python host script to

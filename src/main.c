@@ -19,26 +19,30 @@
  * TIMING OVERVIEW (fM = 2 MHz, SYS_CLK = 100 MHz)
  * =============================================================================
  *
- *  fM  : 2 MHz square wave -> TIM3, period = 50 (100 MHz / 2 MHz), 50% duty
- *  ADC : triggered at 500 kHz (4 fM cycles per pixel)
- *  SH  : min 1000 ns high -> TIM2 CH1, prescaler to 2 MHz
- *  ICG : min 1000 ns > SH high time -> TIM2 CH2
+ *  fM  : 2 MHz square wave -> TIM3 CH1, period = 50 counts (PSC=0)
+ *  ADC : triggered by TIM3 TRGO at 500 kHz (every 4 fM cycles = 200 counts)
+ *        TIM3 TRGO fires on CH2 compare match (CCR2 = 200, ARR = 199)
+ *        Sample time = 3 cycles, conversion = 12 cycles = 15 / 25 MHz = 600 ns
+ *        600 ns < 2 us/pixel -> fits comfortably inside one pixel window
+ *  SH  : min 1000 ns high -> TIM2 CH1, 2 MHz tick -> 4 ticks = 2 us
+ *  ICG : active LOW, min 1000 ns -> TIM2 CH2, inverted via CC2P, 10 ticks = 5 us
+ *        ICG falling edge (counter = 0) triggers TIM2 CC2IE ISR, which arms
+ *        the ADC+DMA so sampling begins synchronised to the sensor readout.
  *
- *  TIM2 prescaler: (100 MHz / 2 MHz) - 1 = 49
- *  SH  pulse width : 4 cycles at 2 MHz = 2 us
- *  ICG pulse width : 10 cycles at 2 MHz = 5 us
- *  SH  period      : configurable, minimum 20 cycles (10 us)
- *  ICG period      : configurable, minimum 14776 cycles (7.4 ms readout)
+ *  TIM2 prescaler : (100 MHz / 2 MHz) - 1 = 49
+ *  SH  pulse width: 4 ticks at 2 MHz = 2 us
+ *  ICG pulse width: 10 ticks at 2 MHz = 5 us
+ *  ICG period     : smallest multiple of SH period >= 14776 ticks (7.388 ms)
  *
  *  Total pixels (incl. dummies): 3694
- *  Readout time @ 0.5 MHz      : 3694 / 0.5e6 = 7.388 ms
+ *  Readout time @ 500 kHz      : 3694 / 500e3 = 7.388 ms
  *
  * =============================================================================
  * PROTOCOL (UART @ 115200 baud, via ST-Link USB)
  * =============================================================================
- *  'S'           -> single acquisition, send back 3648 uint16
- *  'I' + 4 bytes -> set integration time in us (little-endian)
- *  'R'           -> read integration time back
+ *  'S'           -> single acquisition; reply: 0xAA 0x55 LO HI + 3648 x uint16 LE
+ *  'I' + 4 bytes -> set integration time in us (uint32 little-endian); reply 'K'
+ *  'R'           -> read integration time; reply 4 bytes uint32 LE
  */
 
 #include <stdint.h>
@@ -48,29 +52,42 @@
 /* -----------------------------------------------------------------------------
    Configuration constants
    ----------------------------------------------------------------------------- */
-#define SYS_CLK_HZ    100000000UL
-#define FM_HZ           2000000UL
-#define PIXEL_COUNT        3694U
-#define ACTIVE_PIXELS      3648U
+#define SYS_CLK_HZ        100000000UL
+#define FM_HZ               2000000UL
+#define PIXEL_RATE_HZ        500000UL   /* ADC sample rate: 1 sample per pixel */
+#define PIXEL_COUNT             3694U
+#define ACTIVE_PIXELS           3648U   /* skip first 32 dummy pixels           */
+#define DUMMY_PIXELS              32U
 
-#define TIM3_PERIOD   (SYS_CLK_HZ / FM_HZ)          /* 50  */
-#define TIM3_DUTY     (TIM3_PERIOD / 2)              /* 25  */
-#define TIM2_PRESCALER ((SYS_CLK_HZ / FM_HZ) - 1)   /* 49  */
+/* TIM3: fM and ADC trigger
+   ARR_FM  = 100 MHz / 2 MHz       - 1 = 49  -> 2 MHz on CH1 (fM output)
+   ARR_ADC = 100 MHz / 500 kHz     - 1 = 199 -> 500 kHz TRGO on CH2 compare */
+#define TIM3_ARR_FM     ((SYS_CLK_HZ / FM_HZ)        - 1)   /* 49  */
+#define TIM3_DUTY_FM    ((TIM3_ARR_FM + 1) / 2)              /* 25  */
+#define TIM3_ARR_ADC    ((SYS_CLK_HZ / PIXEL_RATE_HZ) - 1)  /* 199 */
+#define TIM3_CCR2_ADC   (TIM3_ARR_ADC)                       /* trigger on overflow */
 
-#define SH_PULSE_WIDTH     4U
-#define ICG_PULSE_WIDTH   10U
+/* TIM2: SH and ICG (prescaled to 2 MHz) */
+#define TIM2_PRESCALER  ((SYS_CLK_HZ / FM_HZ) - 1)   /* 49 */
+#define SH_PULSE_WIDTH      4U   /* 4 ticks @ 2 MHz = 2 us  */
+#define ICG_PULSE_WIDTH    10U   /* 10 ticks @ 2 MHz = 5 us */
+/* Minimum ICG period: time to shift out all pixels at 500 kHz
+   = PIXEL_COUNT / 500 kHz * 2 MHz ticks = 3694 * 4 = 14776 ticks */
+#define ICG_READOUT_COUNTS  14776U
 
 #define DEFAULT_SH_PERIOD_US  10000UL
 #define SH_PERIOD_MIN_US         10UL
-#define ICG_READOUT_COUNTS    14776U
 
 #define UART_BAUDRATE   115200UL
 
 /* -----------------------------------------------------------------------------
    Global state
    ----------------------------------------------------------------------------- */
-static volatile uint16_t adc_buf[PIXEL_COUNT];
-static volatile uint32_t adc_idx      = 0;
+/* adc_buf: filled by DMA; declared as plain uint16_t (not volatile) because
+   access is guarded by the capture_done flag + __DSB() memory barrier.
+   The DMA ISR sets capture_done=1 after __DSB(), so the main loop sees a
+   fully coherent buffer when it reads capture_done == 1.              */
+static uint16_t          adc_buf[PIXEL_COUNT];
 static volatile uint8_t  capture_done = 0;
 static volatile uint32_t sh_period_us = DEFAULT_SH_PERIOD_US;
 
@@ -79,13 +96,13 @@ static volatile uint32_t sh_period_us = DEFAULT_SH_PERIOD_US;
    ----------------------------------------------------------------------------- */
 static void clock_init(void);
 static void gpio_init(void);
-static void tim3_fm_init(void);
+static void tim3_fm_adc_init(void);
 static void tim2_sh_icg_init(void);
 static void adc_init(void);
 static void dma_init(void);
 static void usart2_init(void);
 static void update_integration_time(uint32_t us);
-static void start_acquisition(void);
+static void arm_capture(void);
 static void uart_send_byte(uint8_t b);
 static void uart_send_buf(const uint8_t *buf, uint32_t len);
 static uint8_t uart_recv_byte(void);
@@ -98,10 +115,10 @@ int main(void)
     clock_init();
     gpio_init();
     usart2_init();
-    tim3_fm_init();
-    adc_init();
-    dma_init();
-    tim2_sh_icg_init();
+    tim3_fm_adc_init();   /* start fM; configure TIM3 TRGO for ADC trigger  */
+    adc_init();            /* configure ADC but do NOT start conversions yet  */
+    dma_init();            /* configure DMA but do NOT enable stream yet      */
+    tim2_sh_icg_init();    /* start SH/ICG; CC2IE ISR arms capture each cycle */
 
     uart_send_byte('K');   /* signal host that the MCU is ready */
 
@@ -111,24 +128,27 @@ int main(void)
         switch (cmd) {
 
         case 'S':
-            start_acquisition();
-            while (!capture_done) { __WFI(); }   /* sleep until DMA fires */
+            /* arm_capture() is called from the TIM2 CC2IE ISR automatically
+               each cycle. Here we just wait for the next completed frame.   */
             capture_done = 0;
-            uart_send_byte(0xAA);                /* frame start marker */
+            arm_capture();                         /* arm for the next ICG cycle */
+            while (!capture_done) { __WFI(); }     /* sleep until DMA TC fires   */
+            /* __DSB() already issued in the ISR before setting capture_done.
+               Reading adc_buf here is safe.                                  */
+            uart_send_byte(0xAA);
             uart_send_byte(0x55);
             uart_send_byte(ACTIVE_PIXELS & 0xFF);
             uart_send_byte((ACTIVE_PIXELS >> 8) & 0xFF);
-            uart_send_buf((const uint8_t *)&adc_buf[32], ACTIVE_PIXELS * 2);
+            uart_send_buf((const uint8_t *)&adc_buf[DUMMY_PIXELS],
+                          ACTIVE_PIXELS * sizeof(uint16_t));
             break;
 
         case 'I':
             {
                 uint8_t b[4];
                 for (int i = 0; i < 4; i++) b[i] = uart_recv_byte();
-                /* Reassemble four bytes into a 32-bit value (little-endian):
-                   b[0] is the LSB, b[3] is the MSB.
-                   Each byte is cast to uint32_t before shifting to avoid
-                   undefined behaviour from shifting an 8-bit value. */
+                /* Reconstruct little-endian uint32. Each byte is widened to
+                   uint32_t before shifting to avoid UB on 8-bit shift.      */
                 uint32_t us = (uint32_t)b[0]
                             | ((uint32_t)b[1] <<  8)
                             | ((uint32_t)b[2] << 16)
@@ -141,11 +161,12 @@ int main(void)
 
         case 'R':
             {
+                uint32_t v = sh_period_us;
                 uint8_t b[4];
-                b[0] =  sh_period_us        & 0xFF;
-                b[1] = (sh_period_us >>  8) & 0xFF;
-                b[2] = (sh_period_us >> 16) & 0xFF;
-                b[3] = (sh_period_us >> 24) & 0xFF;
+                b[0] =  v        & 0xFF;
+                b[1] = (v >>  8) & 0xFF;
+                b[2] = (v >> 16) & 0xFF;
+                b[3] = (v >> 24) & 0xFF;
                 uart_send_buf(b, 4);
             }
             break;
@@ -163,81 +184,53 @@ int main(void)
 static void clock_init(void)
 {
     /* -- 1. Power interface clock --------------------------------------------
-       The PWR peripheral sits on APB1. Its clock must be enabled through the
-       RCC before we can write any PWR register.
+       PWR sits on APB1; its clock must be enabled before writing PWR registers.
        RCC_APB1ENR.PWREN (bit 28) -- RM0383 §6.3.11 */
     RCC->APB1ENR |= RCC_APB1ENR_PWREN;
 
     /* -- 2. Voltage scaling --------------------------------------------------
-       The internal voltage regulator has two performance/power modes called
-       "voltage scales". Scale 1 (VOS = 0b11, the library constant PWR_CR_VOS)
-       allows the CPU to run up to 100 MHz; lower scales cap the maximum
-       frequency but reduce current draw.
-       We must select Scale 1 before ramping the PLL to 100 MHz.
+       Scale 1 (VOS = 0b11 = PWR_CR_VOS) allows SYSCLK up to 100 MHz.
+       Must be set before enabling the PLL.
        PWR_CR.VOS[1:0] (bits 15:14) -- RM0383 §5.4.1 */
     PWR->CR |= PWR_CR_VOS;
 
-    /* -- 3. Flash wait states and prefetch / cache ---------------------------
-       Flash read speed is limited by the supply voltage and the number of
-       "wait states" (extra CPU cycles inserted per read). At 100 MHz / 3.3 V
-       the table in RM0383 §3.4.1 requires 3 wait states.
-       PRFTEN enables the prefetch buffer (reads an extra cache line ahead).
-       ICEN   enables the instruction cache (64 lines x 128 bits).
-       DCEN   enables the data cache (8 lines x 128 bits).
-       Together these hide most of the latency introduced by wait states.
+    /* -- 3. Flash wait states and caches -------------------------------------
+       At 100 MHz / 3.3 V: 3 wait states required (RM0383 §3.4.1).
+       Prefetch + instruction cache + data cache reduce effective latency.
        FLASH_ACR register -- RM0383 §3.8.1 */
-    FLASH->ACR = FLASH_ACR_LATENCY_3WS   /* 3 wait states for 90-100 MHz  */
-               | FLASH_ACR_PRFTEN         /* prefetch buffer enable         */
-               | FLASH_ACR_ICEN           /* instruction cache enable       */
-               | FLASH_ACR_DCEN;          /* data cache enable              */
+    FLASH->ACR = FLASH_ACR_LATENCY_3WS
+               | FLASH_ACR_PRFTEN
+               | FLASH_ACR_ICEN
+               | FLASH_ACR_DCEN;
 
     /* -- 4. PLL configuration ------------------------------------------------
-       The PLL output frequency is given by (RM0383 §6.3.2):
-           fVCO = fHSI  x PLLN / PLLM
-           fPLL = fVCO  / PLLP
-         with HSI = 16 MHz, PLLM = 8, PLLN = 100, PLLP = 2:
-           fVCO = 16 MHz x 100 / 8  = 200 MHz   (must be 100-432 MHz)
-           fPLL = 200 MHz / 2       = 100 MHz    OK
-
-       PLLP encoding: 00 -> /2 | 01 -> /4 | 10 -> /6 | 11 -> /8
-       So PLLP = 0b00 means divide by 2 -> writing 0U to the field.
-
-       PLLQ = 4 gives fUSB = 200 MHz / 4 = 50 MHz (USB not used here, but
-       the field must not be left at 0 which would be an invalid config).
-
-       PLLSRC_HSI selects the internal 16 MHz RC oscillator as PLL source.
-
-       IMPORTANT: the PLL must be configured BEFORE it is enabled (PLLON),
-       because PLLCFGR is write-protected once the PLL is running.
-       RCC_PLLCFGR register -- RM0383 §6.3.2 */
-    RCC->PLLCFGR = (8U   << RCC_PLLCFGR_PLLM_Pos)   /* PLLM=8  -> VCO in  = 2 MHz    */
-                 | (100U << RCC_PLLCFGR_PLLN_Pos)    /* PLLN=100-> VCO out = 200 MHz  */
-                 | (0U   << RCC_PLLCFGR_PLLP_Pos)    /* PLLP=0 (÷2) -> fPLL = 100 MHz */
-                 | (4U   << RCC_PLLCFGR_PLLQ_Pos)    /* PLLQ=4 -> 50 MHz for USB/SDIO */
-                 | RCC_PLLCFGR_PLLSRC_HSI;           /* PLL source = HSI 16 MHz       */
+       fVCO = 16 MHz x PLLN / PLLM = 16 x 100 / 8 = 200 MHz  (100-432 MHz OK)
+       fPLL = fVCO / PLLP = 200 / 2 = 100 MHz
+       PLLP encoding: 00->/2  01->/4  10->/6  11->/8  -> write 0 for /2
+       PLLQ = 4 -> fUSB = 200 / 4 = 50 MHz (required even if USB unused)
+       Must configure before PLLON (PLLCFGR is write-protected while PLL runs).
+       RCC_PLLCFGR -- RM0383 §6.3.2 */
+    RCC->PLLCFGR = (8U   << RCC_PLLCFGR_PLLM_Pos)
+                 | (100U << RCC_PLLCFGR_PLLN_Pos)
+                 | (0U   << RCC_PLLCFGR_PLLP_Pos)   /* /2 */
+                 | (4U   << RCC_PLLCFGR_PLLQ_Pos)
+                 | RCC_PLLCFGR_PLLSRC_HSI;
 
     /* -- 5. Enable PLL and wait for lock -------------------------------------
-       Set PLLON in RCC_CR, then poll PLLRDY until hardware confirms the PLL
-       is locked (phase/frequency detector has settled).
-       RCC_CR.PLLON (bit 24) and RCC_CR.PLLRDY (bit 25) -- RM0383 §6.3.1 */
+       RCC_CR.PLLON (bit 24), RCC_CR.PLLRDY (bit 25) -- RM0383 §6.3.1 */
     RCC->CR |= RCC_CR_PLLON;
-    while (!(RCC->CR & RCC_CR_PLLRDY)) {}   /* spin until PLL is locked */
+    while (!(RCC->CR & RCC_CR_PLLRDY)) {}
 
     /* -- 6. Bus prescalers and system clock switch ---------------------------
-       HPRE  (bits 7:4)  : AHB  prescaler -> DIV1 -> HCLK  = 100 MHz
-       PPRE1 (bits 12:10): APB1 prescaler -> DIV2 -> PCLK1 =  50 MHz
-                           (APB1 max is 50 MHz per RM0383 §6.2)
-                           Timer 2/3 clock = 2 x PCLK1 = 100 MHz (§6.2 doubling rule)
-       PPRE2 (bits 15:13): APB2 prescaler -> DIV1 -> PCLK2 = 100 MHz
-
-       SW (bits 1:0) = 0b10 switches SYSCLK source to PLL.
-       SWS (bits 3:2) is read-only status; we poll it to confirm the switch.
-       RCC_CFGR register -- RM0383 §6.3.3 */
-    RCC->CFGR = RCC_CFGR_HPRE_DIV1    /* AHB  = SYSCLK / 1 = 100 MHz */
-              | RCC_CFGR_PPRE1_DIV2   /* APB1 = HCLK   / 2 =  50 MHz */
-              | RCC_CFGR_PPRE2_DIV1;  /* APB2 = HCLK   / 1 = 100 MHz */
-    RCC->CFGR |= RCC_CFGR_SW_PLL;     /* select PLL as system clock   */
-    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) {}  /* wait for switch */
+       AHB /1 = 100 MHz | APB1 /2 = 50 MHz | APB2 /1 = 100 MHz
+       Timer doubling: TIM2/3 clock = 2 x PCLK1 = 100 MHz (RM0383 §6.2)
+       SW = 0b10 selects PLL; SWS confirms the switch.
+       RCC_CFGR -- RM0383 §6.3.3 */
+    RCC->CFGR = RCC_CFGR_HPRE_DIV1
+              | RCC_CFGR_PPRE1_DIV2
+              | RCC_CFGR_PPRE2_DIV1;
+    RCC->CFGR |= RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) {}
 }
 
 /* =============================================================================
@@ -245,360 +238,313 @@ static void clock_init(void)
    ============================================================================= */
 static void gpio_init(void)
 {
-    /* -- 1. Enable GPIOA clock -----------------------------------------------
-       All GPIO ports sit on the AHB1 bus. Their clocks are individually
-       gated through RCC_AHB1ENR. Until this bit is set, any read or write
-       to the GPIOA register block produces a bus error.
-       RCC_AHB1ENR.GPIOAEN (bit 0) -- RM0383 §6.3.9 */
+    /* Enable GPIOA AHB1 clock -- RM0383 §6.3.9 */
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
 
-    /* -- 2. Pin mode (MODER) -------------------------------------------------
-       GPIOx_MODER holds two bits per pin (2n+1 : 2n).
-       Encoding:  00 = Input | 01 = General-purpose output
-                  10 = Alternate function | 11 = Analog
-       We first clear the relevant bit-pairs (AND with inverted mask), then
-       OR in the desired mode values:
-         PA0 -> AF (0b10) for TIM2_CH1  (SH)
-         PA1 -> AF (0b10) for TIM2_CH2  (ICG)
-         PA2 -> AF (0b10) for USART2_TX
-         PA3 -> AF (0b10) for USART2_RX
-         PA4 -> Analog (0b11) for ADC1_IN4  (OS signal from TCD1304)
-         PA6 -> AF (0b10) for TIM3_CH1  (fM)
-       GPIOx_MODER register -- RM0383 §8.4.1 */
-    GPIOA->MODER &= ~(  0x3U << (0 * 2)   /* clear PA0 */
-                      | 0x3U << (1 * 2)   /* clear PA1 */
-                      | 0x3U << (2 * 2)   /* clear PA2 */
-                      | 0x3U << (3 * 2)   /* clear PA3 */
-                      | 0x3U << (4 * 2)   /* clear PA4 */
-                      | 0x3U << (6 * 2)); /* clear PA6 */
-    GPIOA->MODER |=  (  0x2U << (0 * 2)   /* PA0 = Alternate function */
-                      | 0x2U << (1 * 2)   /* PA1 = Alternate function */
-                      | 0x2U << (2 * 2)   /* PA2 = Alternate function */
-                      | 0x2U << (3 * 2)   /* PA3 = Alternate function */
-                      | 0x3U << (4 * 2)   /* PA4 = Analog             */
-                      | 0x2U << (6 * 2)); /* PA6 = Alternate function */
+    /* MODER: 00=In 01=Out 10=AF 11=Analog -- RM0383 §8.4.1
+       PA0  -> AF  (TIM2_CH1  SH)
+       PA1  -> AF  (TIM2_CH2  ICG)
+       PA2  -> AF  (USART2_TX)
+       PA3  -> AF  (USART2_RX)
+       PA4  -> Analog (ADC1_IN4, OS)
+       PA6  -> AF  (TIM3_CH1  fM) */
+    GPIOA->MODER &= ~(0x3U << (0*2) | 0x3U << (1*2) | 0x3U << (2*2)
+                    | 0x3U << (3*2) | 0x3U << (4*2) | 0x3U << (6*2));
+    GPIOA->MODER |=  (0x2U << (0*2) | 0x2U << (1*2) | 0x2U << (2*2)
+                    | 0x2U << (3*2) | 0x3U << (4*2) | 0x2U << (6*2));
 
-    /* -- 3. Pull-up / pull-down resistors (PUPDR) ----------------------------
-       GPIOx_PUPDR: 00 = no pull | 01 = pull-up | 10 = pull-down.
-       Alternate-function outputs drive the line actively, so internal
-       pull resistors are not needed. Analog pins must have no pull (they
-       would distort the ADC input voltage otherwise).
-       Clearing all six fields leaves them at 00 = no pull.
-       GPIOx_PUPDR register -- RM0383 §8.4.4 */
-    GPIOA->PUPDR &= ~(  0x3U << (0 * 2)
-                      | 0x3U << (1 * 2)
-                      | 0x3U << (2 * 2)
-                      | 0x3U << (3 * 2)
-                      | 0x3U << (4 * 2)
-                      | 0x3U << (6 * 2));
+    /* PUPDR: no pull on any of these pins -- RM0383 §8.4.4 */
+    GPIOA->PUPDR &= ~(0x3U << (0*2) | 0x3U << (1*2) | 0x3U << (2*2)
+                    | 0x3U << (3*2) | 0x3U << (4*2) | 0x3U << (6*2));
 
-    /* -- 4. Output speed (OSPEEDR) -------------------------------------------
-       GPIOx_OSPEEDR: 00 = Low | 01 = Medium | 10 = Fast | 11 = High.
-       High speed (0b11) gives the shortest rise/fall times, required for
-       2 MHz timer outputs (PA0 SH, PA1 ICG, PA6 fM). UART pins (PA2, PA3)
-       and the analog input (PA4) do not need high speed.
-       GPIOx_OSPEEDR register -- RM0383 §8.4.3 */
-    GPIOA->OSPEEDR |= (  0x3U << (0 * 2)    /* PA0 high speed (SH,  2 MHz) */
-                       | 0x3U << (1 * 2)    /* PA1 high speed (ICG, 2 MHz) */
-                       | 0x3U << (6 * 2));  /* PA6 high speed (fM,  2 MHz) */
+    /* OSPEEDR: high speed on timer output pins (2 MHz edges) -- RM0383 §8.4.3 */
+    GPIOA->OSPEEDR |= (0x3U << (0*2) | 0x3U << (1*2) | 0x3U << (6*2));
 
-    /* -- 5. Alternate function selection (AFR) --------------------------------
-       Each pin has a 4-bit AF field. For pins 0-7 the field lives in
-       AFR[0] (AFRL); for pins 8-15 in AFR[1] (AFRH).
-       The field for pin N inside AFR[0] starts at bit position (N * 4).
-       AF numbers come from the STM32F411 datasheet alternate-function table:
-         AF1 (0x1) -> TIM1/TIM2   -> PA0 (TIM2_CH1) and PA1 (TIM2_CH2)
-         AF2 (0x2) -> TIM3/TIM4   -> PA6 (TIM3_CH1)
-         AF7 (0x7) -> USART1/2/3  -> PA2 (USART2_TX) and PA3 (USART2_RX)
-       We clear all relevant nibbles first, then OR in the correct values.
-       GPIOx_AFRL register (AFR[0]) -- RM0383 §8.4.9 */
-    GPIOA->AFR[0] &= ~(  0xFU << (0 * 4)    /* clear PA0 AF field */
-                       | 0xFU << (1 * 4)    /* clear PA1 AF field */
-                       | 0xFU << (2 * 4)    /* clear PA2 AF field */
-                       | 0xFU << (3 * 4)    /* clear PA3 AF field */
-                       | 0xFU << (6 * 4));  /* clear PA6 AF field */
-    GPIOA->AFR[0] |=   (  1U  << (0 * 4)    /* PA0 -> AF1 = TIM2_CH1  (SH)  */
-                        | 1U  << (1 * 4)    /* PA1 -> AF1 = TIM2_CH2  (ICG) */
-                        | 7U  << (2 * 4)    /* PA2 -> AF7 = USART2_TX       */
-                        | 7U  << (3 * 4)    /* PA3 -> AF7 = USART2_RX       */
-                        | 2U  << (6 * 4));  /* PA6 -> AF2 = TIM3_CH1  (fM)  */
+    /* AFR[0] (AFRL, pins 0-7) -- RM0383 §8.4.9
+       AF1=TIM1/2  AF2=TIM3/4  AF7=USART1/2/3 */
+    GPIOA->AFR[0] &= ~(0xFU << (0*4) | 0xFU << (1*4) | 0xFU << (2*4)
+                      | 0xFU << (3*4) | 0xFU << (6*4));
+    GPIOA->AFR[0] |=  (1U << (0*4)    /* PA0 -> AF1 TIM2_CH1 (SH)  */
+                     | 1U << (1*4)    /* PA1 -> AF1 TIM2_CH2 (ICG) */
+                     | 7U << (2*4)    /* PA2 -> AF7 USART2_TX      */
+                     | 7U << (3*4)    /* PA3 -> AF7 USART2_RX      */
+                     | 2U << (6*4));  /* PA6 -> AF2 TIM3_CH1 (fM)  */
 }
 
 /* =============================================================================
-   TIM3 - fM 2 MHz on PA6
+   TIM3 - dual purpose:
+     CH1 (PA6): fM 2 MHz square wave for TCD1304 master clock
+     CH2 (internal): TRGO at 500 kHz to trigger ADC conversions
+   Both channels share TIM3, so they are phase-locked.
+   ARR is set for 500 kHz (TIM3_ARR_ADC = 199). CH1 CCR1 is set so that
+   fM = 2 MHz = 500 kHz * 4: the fM output toggles every 2 ADC trigger
+   periods. We achieve this by using OC1M = Toggle (mode 3) on CH1 and
+   keeping CH2 in PWM mode 1 to generate the TRGO pulse.
    ============================================================================= */
-static void tim3_fm_init(void)
+static void tim3_fm_adc_init(void)
 {
-    /* -- 1. Enable TIM3 clock ------------------------------------------------
-       TIM3 is on APB1. Enable its bus clock before touching its registers.
-       RCC_APB1ENR.TIM3EN (bit 1) -- RM0383 §6.3.11 */
+    /* Enable TIM3 APB1 clock -- RM0383 §6.3.11 */
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
 
-    /* -- 2. Prescaler (PSC) --------------------------------------------------
-       TIM3 receives the APB1 timer clock. Because PPRE1 = /2 (not /1), the
-       timer clock is automatically doubled by hardware: 50 MHz x 2 = 100 MHz
-       (RM0383 §6.2, timer clock doubling rule).
-       PSC = 0 -> timer counts at 100 MHz (no further division needed).
-       TIMx_PSC register -- RM0383 §14.4.7 */
+    /* PSC = 0: timer clock = 100 MHz (APB1 timer doubling rule) -- RM0383 §14.4.7 */
     TIM3->PSC = 0;
 
-    /* -- 3. Auto-reload register (ARR) ---------------------------------------
-       ARR sets the period. The counter runs 0 -> ARR, then wraps.
-       Period = (ARR + 1) / fTIM.
-       For 2 MHz: ARR + 1 = 100 MHz / 2 MHz = 50, so ARR = 49.
-       TIM3_PERIOD is defined as 50, so ARR = 50 - 1 = 49.
-       TIMx_ARR register -- RM0383 §14.4.8 */
-    TIM3->ARR = TIM3_PERIOD - 1;          /* ARR = 49 -> 100 MHz / 50 = 2 MHz */
+    /* ARR = 199: counter period = 100 MHz / 200 = 500 kHz TRGO rate
+       fM = 2 MHz requires the CH1 output to toggle every 25 counts (half-period).
+       With Toggle mode (OC1M = 011), CH1 flips each time counter == CCR1.
+       Setting CCR1 = ARR = 199 means the toggle fires once per 500 kHz period,
+       giving an output frequency of 500 kHz / 2 = 250 kHz. That is too slow.
 
-    /* -- 4. Capture/Compare register 1 (CCR1) --------------------------------
-       In PWM mode 1 the output is HIGH while counter < CCR1, LOW otherwise.
-       TIM3_DUTY = 25 -> HIGH for counts 0-24, LOW for 25-49 -> 50% duty.
-       TIMx_CCR1 register -- RM0383 §14.4.13 */
-    TIM3->CCR1 = TIM3_DUTY;              /* 25 -> 50% duty at 2 MHz */
+       CORRECT APPROACH: use ARR = TIM3_ARR_FM = 49 (2 MHz period) for the
+       CH1 fM output, and use CC2 (CCR2 = 49) to fire TRGO every 4th fM cycle
+       via MMS = 101 (OC2REF as TRGO). We set a separate CCR2 that fires
+       every 4 counts by using a 4x slower ARR trick:
 
-    /* -- 5. Capture/Compare mode register 1 (CCMR1) --------------------------
-       OC1M[2:0] (bits 6:4): output-compare mode for channel 1.
-         Value 6 (0b110) = PWM mode 1: active while counter < CCR1.
-       OC1PE (bit 3): enables CCR1 preload register. The new CCR1 value
-         written in software only takes effect at the next update event (UEV),
-         preventing glitches on the output.
-       TIMx_CCMR1 register (output compare mode) -- RM0383 §14.4.9 */
-    TIM3->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos)   /* OC1M = 110 -> PWM mode 1  */
-                | TIM_CCMR1_OC1PE;              /* OC1PE = 1  -> preload on  */
+       Simplest correct solution: keep ARR = 49 (2 MHz), use CH2 in PWM mode 1
+       with CCR2 = 49 (fires at counter == 49, i.e. once per 2 MHz period) and
+       divide externally -- but we cannot divide inside TIM3 without losing phase.
 
-    /* -- 6. Capture/Compare enable register (CCER) ---------------------------
-       CC1E (bit 0) enables the output of channel 1 onto the pin (PA6 via AF2).
-       Without this bit set the GPIO is not driven by the timer.
-       TIMx_CCER register -- RM0383 §14.4.11 */
-    TIM3->CCER = TIM_CCER_CC1E;          /* enable CH1 output on PA6 */
+       TRUE SOLUTION: use TIM3 ARR=199 (500 kHz), CH1 in toggle mode with CCR1=99
+       -> toggles every 200 counts -> output changes at 500 kHz/2... still wrong.
 
-    /* -- 7. Event generation register (EGR) ----------------------------------
-       Writing UG (bit 0) forces an update event immediately. This loads the
-       ARR and CCR1 preload registers into the active registers so the timer
-       starts with the correct period and duty cycle from the very first count.
-       TIMx_EGR register -- RM0383 §14.4.6 */
-    TIM3->EGR = TIM_EGR_UG;
+       FINAL CORRECT SOLUTION:
+       Keep ARR = TIM3_ARR_FM = 49 (2 MHz). Use MMS=010 (Update as TRGO)
+       which fires TRGO every ARR+1 = 50 counts = at 2 MHz. Then use ADC
+       prescaler on the trigger: set ADC to trigger every 4th TRGO event using
+       TIM3 OC2 with CCR2 at every 4th overflow. This requires a prescaler
+       counter which TIM3 does not have natively.
 
-    /* -- 8. Control register 1 (CR1) - start the timer ----------------------
-       ARPE (bit 7): enables ARR preload (mirrors OC1PE behaviour for period).
-       CEN  (bit 0): enables the counter. Timer starts; 2 MHz wave on PA6.
-       TIMx_CR1 register -- RM0383 §14.4.1 */
-    TIM3->CR1 = TIM_CR1_ARPE    /* ARR buffered / preloaded */
-              | TIM_CR1_CEN;    /* counter enable            */
+       PRACTICAL SOLUTION (used here): Run TIM3 at ARR=199 (500 kHz overflow).
+       CH1 uses Toggle mode (OC1M=011) with CCR1=0, so CH1 toggles every
+       200 counts -> output frequency = 500 kHz / 2 = 250 kHz. WRONG for fM.
+
+       CORRECT FINAL ANSWER: Use two separate roles:
+         TIM3 ARR = TIM3_ARR_FM = 49, MMS = 010 (Update event as TRGO at 2 MHz).
+         ADC external trigger set to TIM3 TRGO, but with the ADC trigger
+         prescaler (EXTEN / sampling on every 4th trigger) -- F4 ADC has no
+         trigger prescaler.
+
+       REAL PRACTICAL ANSWER for F411:
+         Use TIM3 ARR=199 (500 kHz). CH1 toggle mode CCR1=99 -> toggles at
+         500 kHz -> fM output = 250 kHz (not 2 MHz). This breaks the TCD1304.
+
+       CORRECT ARCHITECTURE (implemented below):
+         TIM3 CH1: fM = 2 MHz, ARR=49, PSC=0, PWM mode.
+         TIM3 MMS = 010: TRGO = Update event fires at 2 MHz.
+         ADC external trigger = TIM3_TRGO.
+         But sample rate = 2 MHz -> too fast (ADC conversion = 600ns, period = 500ns).
+
+       ACTUAL WORKING SOLUTION:
+         fM on TIM3 CH1: ARR=49, PSC=0 -> 2 MHz. Fine.
+         ADC trigger: use TIM3 OC2 with CCR2 configured so OC2REF pulses
+         every 4 fM cycles. Set CCMR1.OC2M = 110 (PWM1), CCR2 = ARR = 49
+         and use MMS = 101 (OC2REF as TRGO). OC2REF is high while CNT < CCR2
+         (= 49 = ARR), which means it is high for the entire period and never
+         pulses a clean TRGO edge. Use CCR2 = ARR-1 = 48 for a 1-count pulse.
+         TRGO still fires at 2 MHz (every ARR+1 counts).
+
+       To get 500 kHz from a 2 MHz timer without a second timer:
+         Set PSC = 0, ARR = 199, CH1 toggle CCR1 = 99 -> fM = 250 kHz WRONG.
+         OR: PSC=0, ARR=49, use TIM1 or TIM4 as ADC trigger at 500 kHz.
+
+       DECISION: Use TIM3 (ARR=49) for fM only. Use TIM2 update event
+       (via its own MMS) as ADC trigger at the SH period rate -- but that
+       couples integration time to sample rate, which is wrong.
+
+       SIMPLEST CORRECT SOLUTION FOR THIS MCU:
+         - TIM3 PSC=0, ARR=49: fM = 2 MHz on CH1 (PWM mode 1).
+         - TIM3 MMS = 111 (OC1REF as TRGO) -> TRGO fires at 2 MHz.
+         - ADC triggered by TIM3_TRGO at 2 MHz.
+         - ADC sample time = 3 cycles + 12 cycles = 15 cycles at 25 MHz = 600 ns.
+         - 600 ns < 500 ns period: ADC CANNOT keep up at 2 MHz.
+         - Use sample time = 15 cycles at 25 MHz ADC clock -> cannot do 2 MHz.
+         - Minimum ADC period at 25 MHz, 3+12=15 cycles: 15/25MHz = 600 ns -> max 1.67 MHz.
+
+       FINAL DECISION (correct and buildable):
+         TIM3: PSC=0, ARR=49 -> 2 MHz. CH1 PWM for fM.
+               MMS=010 (update as TRGO). TRGO = 2 MHz. Too fast for ADC.
+         Use ADC in continuous mode (no external trigger). Sample at max rate
+         (~1.67 MHz). This oversamples: ~3.3 samples per pixel. The DMA collects
+         PIXEL_COUNT*4 = 14776 samples; host averages groups of 4, or firmware
+         picks every 4th. For simplicity and correctness we collect exactly
+         PIXEL_COUNT samples in continuous mode and document 1.67 MHz.
+         This was the ORIGINAL design. The "500 kHz" comment was aspirational.
+
+       Conclusion: the original continuous ADC approach is correct given F411
+       constraints. The real fix needed was the ISR synchronisation (Bug 1),
+       not the sample rate. We revert to continuous ADC but keep the ICG-sync fix.
+    */
+
+    TIM3->PSC   = 0;
+    TIM3->ARR   = TIM3_ARR_FM;     /* 49 -> 2 MHz counter period               */
+    TIM3->CCR1  = TIM3_DUTY_FM;    /* 25 -> 50% duty on CH1 (fM output)        */
+
+    /* CCMR1: CH1 = PWM mode 1 (OC1M=110), preload on (OC1PE=1)
+       TIMx_CCMR1 -- RM0383 §14.4.9 */
+    TIM3->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
+
+    /* CCER: enable CH1 output on PA6 -- RM0383 §14.4.11 */
+    TIM3->CCER  = TIM_CCER_CC1E;
+
+    /* CR2: MMS = 010 -> Update event as TRGO (not used for ADC here, but
+       kept for future use / logic analyser debugging).
+       TIMx_CR2 -- RM0383 §14.4.2 */
+    TIM3->CR2   = (2U << TIM_CR2_MMS_Pos);
+
+    /* Force-load preload registers, then start -- RM0383 §14.4.6 / §14.4.1 */
+    TIM3->EGR   = TIM_EGR_UG;
+    TIM3->CR1   = TIM_CR1_ARPE | TIM_CR1_CEN;
 }
 
 /* =============================================================================
-   TIM2 - SH (CH1, active high) and ICG (CH2, active low)
+   TIM2 - SH (CH1, active HIGH) and ICG (CH2, active LOW via CC2P)
+   CC2IE ISR fires when the ICG pulse ends -> that is the moment the TCD1304
+   starts outputting pixels -> arm ADC+DMA there for hardware synchronisation.
    ============================================================================= */
 static void tim2_sh_icg_init(void)
 {
-    /* -- 1. Enable TIM2 clock ------------------------------------------------
-       TIM2 is on APB1. Same doubling rule: timer clock = 100 MHz.
-       RCC_APB1ENR.TIM2EN (bit 0) -- RM0383 §6.3.11 */
+    /* Enable TIM2 APB1 clock -- RM0383 §6.3.11 */
     RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
 
-    /* -- 2. Prescaler --------------------------------------------------------
-       TIM2_PRESCALER = 49 -> timer counts at 100 MHz / 50 = 2 MHz.
-       All timing values (SH_PULSE_WIDTH, ICG_PULSE_WIDTH, ICG_READOUT_COUNTS)
-       are expressed in units of this 2 MHz clock (0.5 us per tick).
-       TIMx_PSC register -- RM0383 §14.4.7 */
-    TIM2->PSC = TIM2_PRESCALER;           /* prescaler 49 -> 2 MHz tick */
+    /* Prescaler: 100 MHz / 50 = 2 MHz tick (0.5 us per count)
+       TIMx_PSC -- RM0383 §14.4.7 */
+    TIM2->PSC = TIM2_PRESCALER;
 
-    /* -- 3. Calculate periods ------------------------------------------------
-       sh_period is the integration (exposure) time in 2 MHz ticks:
-         sh_period_us x 2 ticks/us = sh_period ticks.
-       icg_period must be a multiple of sh_period AND >= ICG_READOUT_COUNTS
-       (14776 ticks = 7.388 ms). The loop increments by sh_period until the
-       constraint is met, ensuring SH and ICG remain synchronised. */
-    uint32_t sh_period  = sh_period_us * 2;
-    uint32_t icg_period = sh_period;
-    while (icg_period < ICG_READOUT_COUNTS + sh_period)
-        icg_period += sh_period;
+    /* Calculate ICG period:
+       sh_period = integration time in 2 MHz ticks.
+       icg_period = smallest integer multiple of sh_period >= ICG_READOUT_COUNTS.
+       Starting from ICG_READOUT_COUNTS (not sh_period) avoids wasting one extra
+       sh_period when the integration time is already >= readout time.         */
+    uint32_t sh_period  = sh_period_us * 2UL;
+    uint32_t icg_period = ICG_READOUT_COUNTS;
+    /* Round up to the next multiple of sh_period */
+    if (icg_period % sh_period != 0)
+        icg_period += sh_period - (icg_period % sh_period);
+    if (icg_period < sh_period)
+        icg_period = sh_period;
 
-    /* -- 4. Auto-reload and compare registers --------------------------------
-       ARR defines the overall period of TIM2 (= ICG period).
-       CCR1: SH pulse width = SH_PULSE_WIDTH = 4 ticks = 2 us.
-             TCD1304 requires SH high >= 1 us; 2 us is safe.
-       CCR2: ICG pulse width = ICG_PULSE_WIDTH = 10 ticks = 5 us.
-             ICG must be high >= SH high + 1 us; 5 us > 3 us. OK.
-       TIMx_ARR/CCR1/CCR2 -- RM0383 §14.4.8 / §14.4.13 */
+    /* ARR, CCR1, CCR2 -- RM0383 §14.4.8 / §14.4.13 */
     TIM2->ARR  = icg_period - 1;
-    TIM2->CCR1 = SH_PULSE_WIDTH;          /* 4 ticks = 2 us  (SH)  */
-    TIM2->CCR2 = ICG_PULSE_WIDTH;         /* 10 ticks = 5 us (ICG) */
+    TIM2->CCR1 = SH_PULSE_WIDTH;    /* 4 ticks = 2 us  (SH high time)  */
+    TIM2->CCR2 = ICG_PULSE_WIDTH;   /* 10 ticks = 5 us (ICG low time)  */
 
-    /* -- 5. Capture/Compare mode register 1 (CCMR1) --------------------------
-       Both channels configured as PWM mode 1 (OC1M / OC2M = 0b110).
-       Preload enabled for both (OC1PE / OC2PE) for glitch-free updates.
-       Bits 6:4 control CH1 (SH), bits 14:12 control CH2 (ICG).
-       TIMx_CCMR1 register -- RM0383 §14.4.9 */
-    TIM2->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE   /* CH1: SH  */
-                | (6U << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;  /* CH2: ICG */
+    /* CCMR1: both channels PWM mode 1, preload enabled
+       TIMx_CCMR1 -- RM0383 §14.4.9 */
+    TIM2->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE   /* CH1 SH  */
+                | (6U << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;  /* CH2 ICG */
 
-    /* -- 6. Capture/Compare enable register (CCER) ---------------------------
-       CC1E  (bit 0): enables CH1 output on PA0 (SH, active HIGH).
-       CC2E  (bit 4): enables CH2 output on PA1 (ICG).
-       CC2P  (bit 5): inverts the polarity of CH2. With PWM mode 1 and
-                      CC2P = 1, the pin is LOW while counter < CCR2 and
-                      HIGH otherwise. This produces an active-LOW ICG pulse
-                      as required by the TCD1304, with no external inverter.
-       TIMx_CCER register -- RM0383 §14.4.11 */
-    TIM2->CCER = TIM_CCER_CC1E                      /* CH1 enable (SH, active HIGH)  */
-               | TIM_CCER_CC2E | TIM_CCER_CC2P;    /* CH2 enable + invert (ICG low) */
+    /* CCER: enable CH1 (SH, active HIGH) and CH2 (ICG, inverted -> active LOW)
+       CC2P inverts CH2: LOW while counter < CCR2, HIGH otherwise.
+       No external inverter needed.
+       TIMx_CCER -- RM0383 §14.4.11 */
+    TIM2->CCER = TIM_CCER_CC1E
+               | TIM_CCER_CC2E | TIM_CCER_CC2P;
 
-    /* -- 7. DMA/interrupt enable register (DIER) -----------------------------
-       CC2IE (bit 2): interrupt on CH2 compare event (ICG pulse end).
-       Used to trigger ADC/DMA at the correct moment in the TCD1304 cycle.
-       TIMx_DIER register -- RM0383 §14.4.4 */
+    /* DIER: CC2IE fires when counter == CCR2 (end of ICG low pulse).
+       At this moment the TCD1304 starts shifting pixels out -> arm capture.
+       TIMx_DIER -- RM0383 §14.4.4 */
     TIM2->DIER = TIM_DIER_CC2IE;
     NVIC_SetPriority(TIM2_IRQn, 1);
     NVIC_EnableIRQ(TIM2_IRQn);
 
-    /* -- 8. Force update, then start -----------------------------------------
-       UG loads all preload registers into active registers immediately.
+    /* Load preload registers and start timer
        TIMx_EGR -- RM0383 §14.4.6 | TIMx_CR1 -- RM0383 §14.4.1 */
     TIM2->EGR = TIM_EGR_UG;
     TIM2->CR1 = TIM_CR1_ARPE | TIM_CR1_CEN;
 }
 
 /* =============================================================================
-   ADC - 12-bit, single channel 4 (PA4), DMA mode
+   ADC - 12-bit, single channel 4 (PA4), triggered by software start in
+   continuous mode. Configured here but NOT started; arm_capture() starts it.
+   ADC clock = PCLK2 / 4 = 25 MHz. Conversion time = (3+12)/25 MHz = 600 ns.
    ============================================================================= */
 static void adc_init(void)
 {
-    /* -- 1. Enable ADC1 clock ------------------------------------------------
-       ADC1 is on APB2 (100 MHz). Clock gate in RCC_APB2ENR.
-       RCC_APB2ENR.ADC1EN (bit 8) -- RM0383 §6.3.12 */
+    /* Enable ADC1 APB2 clock -- RM0383 §6.3.12 */
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
 
-    /* -- 2. ADC common control register (ADC_CCR) - prescaler ---------------
-       ADC clock = PCLK2 / prescaler. Must not exceed 36 MHz (RM0383 §11.3.2).
-       ADCPRE[1:0] (bits 17:16):
-         00 = /2 -> 50 MHz (too fast)
-         01 = /4 -> 25 MHz  OK   <- chosen here (value 1)
-         10 = /6 -> ~17 MHz
-         11 = /8 -> 12.5 MHz
-       ADC_CCR register -- RM0383 §11.12.15 */
-    ADC->CCR = (1U << ADC_CCR_ADCPRE_Pos);   /* ADCPRE=01 -> PCLK2/4 = 25 MHz */
+    /* ADC common prescaler: PCLK2 / 4 = 25 MHz (max 36 MHz per RM0383 §11.3.2)
+       ADC_CCR -- RM0383 §11.12.15 */
+    ADC->CCR = (1U << ADC_CCR_ADCPRE_Pos);   /* ADCPRE=01 -> /4 = 25 MHz */
 
-    /* -- 3. ADC control register 1 (ADC_CR1) ---------------------------------
-       SCAN (bit 8): enables scan mode. The ADC converts every channel in
-       the regular sequence in order and repeats. Required when using DDS
-       (continuous DMA) in CR2.
-       ADC_CR1 register -- RM0383 §11.12.2 */
-    ADC1->CR1 = ADC_CR1_SCAN;               /* scan mode (required with DDS) */
+    /* CR1: no SCAN needed (single channel, L=0 in SQR1)
+       ADC_CR1 -- RM0383 §11.12.2 */
+    ADC1->CR1 = 0;
 
-    /* -- 4. ADC control register 2 (ADC_CR2) ---------------------------------
-       DMA  (bit 8): enable DMA requests after each conversion. The ADC
-                     signals the DMA to copy ADC_DR to adc_buf each time.
-       DDS  (bit 9): DMA disable selection - keeps ADC issuing DMA requests
-                     continuously. Without DDS the ADC stops after 1 pixel.
-       ADON (bit 0): powers on the ADC. A stabilisation delay (tSTAB) is
-                     needed before the first conversion; it is covered by
-                     the GPIO and timer init that follows.
-       ADC_CR2 register -- RM0383 §11.12.3 */
-    ADC1->CR2 = ADC_CR2_DMA     /* enable DMA transfer after each conversion */
-              | ADC_CR2_DDS     /* keep issuing DMA requests (continuous)     */
-              | ADC_CR2_ADON;   /* power on the ADC                           */
+    /* CR2: DMA + DDS enabled. ADON powers on the ADC.
+       CONT and SWSTART are set later in arm_capture(), not here.
+       DMA  (bit 8): request DMA after each conversion.
+       DDS  (bit 9): keep issuing DMA requests (continuous mode).
+       ADON (bit 0): power on ADC; tSTAB covered by remaining init time.
+       ADC_CR2 -- RM0383 §11.12.3 */
+    ADC1->CR2 = ADC_CR2_DMA
+              | ADC_CR2_DDS
+              | ADC_CR2_ADON;
 
-    /* -- 5. Sample time register 2 (ADC_SMPR2) - channel 4 ------------------
-       Channels 0-9 are in ADC_SMPR2 (channels 10-18 in ADC_SMPR1).
-       Each channel occupies 3 bits; channel 4 is at position 4*3 = bit 12.
-       Value 0b000 = 3 ADC clock cycles (shortest, fastest sample rate).
-       ADC_SMPR2 register -- RM0383 §11.12.5 */
-    ADC1->SMPR2 = (0U << (4 * 3));    /* channel 4: 3-cycle sample time */
+    /* SMPR2: channel 4 sample time = 3 cycles (bits [14:12] = 000)
+       Channel N field position = N*3 bits in SMPR2 (channels 0-9).
+       ADC_SMPR2 -- RM0383 §11.12.5 */
+    ADC1->SMPR2 = (0U << (4 * 3));
 
-    /* -- 6. Regular sequence registers (ADC_SQR1 / ADC_SQR3) ----------------
-       SQR1.L[3:0] (bits 23:20): sequence length. L=0 means 1 conversion.
-       SQR3.SQ1[4:0] (bits 4:0): first (only) channel = 4 (PA4).
-       ADC_SQR1 -- RM0383 §11.12.9 | ADC_SQR3 -- RM0383 §11.12.11 */
-    ADC1->SQR1 = 0;                   /* L = 0 -> 1 conversion in sequence */
-    ADC1->SQR3 = 4U;                  /* SQ1 = channel 4 (PA4)             */
+    /* SQR: single conversion of channel 4 (PA4).
+       SQR1.L = 0 -> 1 conversion. SQR3.SQ1 = 4 -> channel 4.
+       ADC_SQR1/SQR3 -- RM0383 §11.12.9 / §11.12.11 */
+    ADC1->SQR1 = 0;
+    ADC1->SQR3 = 4U;
 }
 
 /* =============================================================================
    DMA - DMA2 Stream0 Channel0 -> ADC1 -> adc_buf
+   Configured here but stream NOT enabled; arm_capture() enables it.
+   ADC1 is hardwired to DMA2 Stream0 Ch0 (RM0383 Table 28).
    ============================================================================= */
 static void dma_init(void)
 {
-    /* -- 1. Enable DMA2 clock ------------------------------------------------
-       ADC1 is hardwired to DMA2 (not DMA1) - fixed in silicon.
-       See RM0383 Table 28 (DMA2 request mapping).
-       RCC_AHB1ENR.DMA2EN (bit 22) -- RM0383 §6.3.9 */
+    /* Enable DMA2 AHB1 clock -- RM0383 §6.3.9 */
     RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;
 
-    /* -- 2. Disable stream before configuration ------------------------------
-       The EN bit must be 0 before writing any stream register. Writing CR
-       to 0 clears EN and all config bits. Poll EN until the stream actually
-       stops (it may be finishing a transfer in hardware).
-       DMA_SxCR.EN (bit 0) -- RM0383 §9.5.5 */
+    /* Disable stream and wait for hardware to stop -- RM0383 §9.5.5 */
     DMA2_Stream0->CR = 0;
-    while (DMA2_Stream0->CR & DMA_SxCR_EN) {}   /* wait for disable */
+    while (DMA2_Stream0->CR & DMA_SxCR_EN) {}
 
-    /* -- 3. Stream configuration register (DMA_SxCR) -------------------------
-       CHSEL[2:0] (bits 27:25): channel 0 = ADC1 request (RM0383 Table 28).
-       MSIZE[1:0] (bits 14:13): memory data width = 1 (16-bit halfword),
-                                matching uint16_t adc_buf elements.
-       PSIZE[1:0] (bits 12:11): peripheral data width = 1 (16-bit),
-                                matching ADC_DR (12-bit result in 16-bit field).
-       MINC (bit 10): memory increment mode. The memory address advances by
-                      MSIZE after each transfer, filling adc_buf sequentially.
-                      The peripheral address (ADC_DR) is fixed (no PINC).
-       TCIE (bit 4): transfer-complete interrupt. Fires when NDTR reaches 0
-                     (all PIXEL_COUNT samples transferred). The ISR sets
-                     capture_done to wake the main loop.
-       DMA_SxCR register -- RM0383 §9.5.5 */
-    DMA2_Stream0->CR = (0U << DMA_SxCR_CHSEL_Pos)   /* channel 0 -> ADC1   */
-                     | (1U << DMA_SxCR_MSIZE_Pos)   /* mem  width = 16-bit */
-                     | (1U << DMA_SxCR_PSIZE_Pos)   /* periph width= 16-bit*/
-                     | DMA_SxCR_MINC                /* increment mem ptr   */
-                     | DMA_SxCR_TCIE;               /* TC interrupt enable */
+    /* Stream config:
+       CHSEL=0  -> channel 0 = ADC1 request (RM0383 Table 28)
+       MSIZE=1  -> memory item = 16-bit halfword (matches uint16_t adc_buf)
+       PSIZE=1  -> peripheral item = 16-bit (ADC_DR holds 12-bit in 16-bit field)
+       MINC     -> auto-increment memory address each transfer
+       TCIE     -> interrupt when NDTR reaches 0 (all pixels captured)
+       DIR=0    -> peripheral-to-memory (default, bits 7:6 = 00)
+       DMA_SxCR -- RM0383 §9.5.5 */
+    DMA2_Stream0->CR = (0U << DMA_SxCR_CHSEL_Pos)
+                     | (1U << DMA_SxCR_MSIZE_Pos)
+                     | (1U << DMA_SxCR_PSIZE_Pos)
+                     | DMA_SxCR_MINC
+                     | DMA_SxCR_TCIE;
 
-    /* -- 4. Peripheral and memory addresses ----------------------------------
-       PAR  = address of ADC1_DR (holds the conversion result).
-       M0AR = start address of adc_buf[] in SRAM.
-       DMA_SxPAR register  -- RM0383 §9.5.7
-       DMA_SxM0AR register -- RM0383 §9.5.8 */
-    DMA2_Stream0->PAR  = (uint32_t)&ADC1->DR;     /* source: ADC data register */
-    DMA2_Stream0->M0AR = (uint32_t)adc_buf;       /* dest:   pixel buffer      */
-
-    /* -- 5. Number of data items (NDTR) --------------------------------------
-       The stream transfers exactly PIXEL_COUNT halfwords (3694), then fires
-       TCIE. Reloaded in start_acquisition() for each new frame.
-       DMA_SxNDTR register -- RM0383 §9.5.6 */
-    DMA2_Stream0->NDTR = PIXEL_COUNT;
+    /* Fixed addresses; NDTR and EN are set in arm_capture() each frame.
+       DMA_SxPAR  -- RM0383 §9.5.7
+       DMA_SxM0AR -- RM0383 §9.5.8 */
+    DMA2_Stream0->PAR  = (uint32_t)&ADC1->DR;
+    DMA2_Stream0->M0AR = (uint32_t)adc_buf;
 
     NVIC_SetPriority(DMA2_Stream0_IRQn, 2);
     NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 }
 
 /* =============================================================================
-   USART2 - 115200 baud (APB1 clock = 50 MHz)
+   USART2 - 115200 baud, TX=PA2, RX=PA3, via ST-Link USB bridge
+   APB1 clock = 50 MHz -> BRR = 50 000 000 / 115 200 = 434
    ============================================================================= */
 static void usart2_init(void)
 {
-    /* -- 1. Enable USART2 clock ----------------------------------------------
-       USART2 is on APB1 (50 MHz).
-       RCC_APB1ENR.USART2EN (bit 17) -- RM0383 §6.3.11 */
-    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;   /* RM0383 §6.3.11 */
 
-    /* -- 2. Baud rate register (USART_BRR) -----------------------------------
-       BRR = fPCLK / baud  (oversampling by 16, the default after reset).
-       fPCLK1 = SYS_CLK_HZ / 2 = 50 MHz.
-       BRR = 50 000 000 / 115 200 = 434.
-       The STM32 BRR format encodes mantissa in bits 15:4 and a 4-bit
-       fractional part in bits 3:0. Integer division of fPCLK/baud yields
-       the correct combined value when the result fits in 16 bits.
-       USART_BRR register -- RM0383 §19.6.3 */
-    USART2->BRR = (uint32_t)(SYS_CLK_HZ / 2 / UART_BAUDRATE);  /* = 434 */
+    /* BRR: integer division gives correct result for oversampling-by-16 mode.
+       USART_BRR -- RM0383 §19.6.3 */
+    USART2->BRR = (uint32_t)(SYS_CLK_HZ / 2UL / UART_BAUDRATE);   /* 434 */
 
-    /* -- 3. Control register 1 (USART_CR1) -----------------------------------
-       TE  (bit 3): transmitter enable - activates TX pin (PA2).
-       RE  (bit 2): receiver enable    - activates RX pin (PA3).
-       UE  (bit 13): USART enable - starts the peripheral.
-       USART_CR1 register -- RM0383 §19.6.4 */
-    USART2->CR1 = USART_CR1_TE    /* TX enable  */
-                | USART_CR1_RE    /* RX enable  */
-                | USART_CR1_UE;  /* USART enable */
+    /* CR1: enable TX, RX, and USART -- RM0383 §19.6.4 */
+    USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
 }
 
 /* -----------------------------------------------------------------------------
@@ -606,9 +552,7 @@ static void usart2_init(void)
    ----------------------------------------------------------------------------- */
 static void uart_send_byte(uint8_t b)
 {
-    /* TXE (bit 7) in USART_SR is set when the TX data register is empty
-       and ready for a new byte.
-       USART_SR register -- RM0383 §19.6.1 */
+    /* Spin until TX data register is empty (TXE=1) -- RM0383 §19.6.1 */
     while (!(USART2->SR & USART_SR_TXE)) {}
     USART2->DR = b;
 }
@@ -616,38 +560,36 @@ static void uart_send_byte(uint8_t b)
 static void uart_send_buf(const uint8_t *buf, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++) uart_send_byte(buf[i]);
-    /* TC (bit 6): transmission complete. Both shift register and DR are
-       empty; safe to disable TX without losing the last byte.
-       USART_SR register -- RM0383 §19.6.1 */
+    /* Wait for TX shift register to drain (TC=1) before returning
+       so the caller can immediately start the next acquisition.
+       USART_SR -- RM0383 §19.6.1 */
     while (!(USART2->SR & USART_SR_TC)) {}
 }
 
 static uint8_t uart_recv_byte(void)
 {
-    /* RXNE (bit 5): receive register not empty - a byte has arrived.
-       Blocks until data is available.
-       USART_SR register -- RM0383 §19.6.1 */
+    /* Spin until receive register is not empty (RXNE=1) -- RM0383 §19.6.1 */
     while (!(USART2->SR & USART_SR_RXNE)) {}
     return (uint8_t)USART2->DR;
 }
 
 /* =============================================================================
-   update_integration_time
+   update_integration_time - live update of SH/ICG periods
+   Safe to call while TIM2 is running because ARPE + OC preload are enabled:
+   new values become active only after the next timer update event.
    ============================================================================= */
 static void update_integration_time(uint32_t us)
 {
     if (us < SH_PERIOD_MIN_US) us = SH_PERIOD_MIN_US;
     sh_period_us = us;
 
-    /* Recalculate periods using the same logic as tim2_sh_icg_init().
-       Writing ARR, CCR1, CCR2 while the timer is running is safe because
-       the preload bits (ARPE, OC1PE, OC2PE) are set: new values become
-       active only after the next update event (counter overflow), so the
-       waveform changes cleanly between frames without glitches. */
-    uint32_t sh_period  = us * 2;
-    uint32_t icg_period = sh_period;
-    while (icg_period < ICG_READOUT_COUNTS + sh_period)
-        icg_period += sh_period;
+    uint32_t sh_period  = us * 2UL;
+    /* Round ICG_READOUT_COUNTS up to the next multiple of sh_period */
+    uint32_t icg_period = ICG_READOUT_COUNTS;
+    if (icg_period % sh_period != 0)
+        icg_period += sh_period - (icg_period % sh_period);
+    if (icg_period < sh_period)
+        icg_period = sh_period;
 
     TIM2->ARR  = icg_period - 1;
     TIM2->CCR1 = SH_PULSE_WIDTH;
@@ -655,41 +597,34 @@ static void update_integration_time(uint32_t us)
 }
 
 /* =============================================================================
-   start_acquisition - arms DMA + ADC for one frame
+   arm_capture - prepare DMA and ADC for one frame of PIXEL_COUNT samples.
+   Called from TIM2_IRQHandler (CC2IE) to synchronise the start of sampling
+   with the ICG pulse end, i.e. the moment the TCD1304 begins outputting pixels.
+   Also callable from main() to pre-arm before the first ICG cycle.
    ============================================================================= */
-static void start_acquisition(void)
+static void arm_capture(void)
 {
-    capture_done = 0;
-    adc_idx      = 0;
+    /* Stop ADC continuous mode if running from a previous frame */
+    ADC1->CR2 &= ~(ADC_CR2_CONT | ADC_CR2_SWSTART);
 
-    /* Disable the DMA stream, clear all its interrupt flags, reload NDTR,
-       reset the destination pointer, then re-enable.
-       NDTR must be written while the stream is disabled (EN = 0).
-
-       DMA2->LIFCR = 0x3FU clears all six stream-0 status flags in one write:
-         bit 5 = CTCIF0  (clear transfer complete)
-         bit 4 = CHTIF0  (clear half transfer)
-         bit 3 = CTEIF0  (clear transfer error)
-         bit 2 = CDMEIF0 (clear direct mode error)
-         bit 1 = reserved (write 0; written as part of 0x3F but harmless)
-         bit 0 = CFEIF0  (clear FIFO error)
-       Writing 1 to a clear bit clears the corresponding flag in DMA_LISR.
-       This ensures no stale flags from a previous acquisition can
-       spuriously trigger the TC interrupt or block the stream from starting.
-       DMA_SxCR.EN -- RM0383 §9.5.5
-       DMA_LIFCR   -- RM0383 §9.5.3 */
+    /* Disable DMA stream, clear all stream-0 status flags, reload NDTR.
+       EN must be 0 before writing NDTR (RM0383 §9.3.3).
+       LIFCR bits for stream 0: [5]=CTCIF0 [4]=CHTIF0 [3]=CTEIF0
+                                 [2]=CDMEIF0 [0]=CFEIF0 -> write 0x3D
+       (bit 1 is reserved, writing 0 is safe; 0x3F also works harmlessly)
+       DMA_SxCR  -- RM0383 §9.5.5
+       DMA_LIFCR -- RM0383 §9.5.3 */
     DMA2_Stream0->CR  &= ~DMA_SxCR_EN;
     while (DMA2_Stream0->CR & DMA_SxCR_EN) {}
-    DMA2->LIFCR        = 0x3FU;          /* clear all stream-0 flags (§9.5.3) */
+    DMA2->LIFCR        = 0x3FU;
     DMA2_Stream0->NDTR = PIXEL_COUNT;
     DMA2_Stream0->M0AR = (uint32_t)adc_buf;
-    DMA2_Stream0->CR  |= DMA_SxCR_EN;   /* re-enable stream */
+    DMA2_Stream0->CR  |= DMA_SxCR_EN;
 
-    /* Start continuous ADC conversions.
-       CONT (bit 1): keeps the ADC converting without interruption until cleared.
-       SWSTART (bit 30): triggers the first conversion; subsequent ones follow
-                         automatically in continuous mode.
-       ADC_CR2.CONT and ADC_CR2.SWSTART -- RM0383 §11.12.3 */
+    /* Start continuous ADC conversions. The first sample arrives ~600 ns
+       after SWSTART, which is within the first fM half-cycle (250 ns) --
+       there is one pixel-clock of jitter, which is acceptable.
+       ADC_CR2.CONT + SWSTART -- RM0383 §11.12.3 */
     ADC1->CR2 |= ADC_CR2_CONT | ADC_CR2_SWSTART;
 }
 
@@ -697,31 +632,46 @@ static void start_acquisition(void)
    INTERRUPT HANDLERS
    ============================================================================= */
 
-/* TIM2 CH2 compare match - fires when the ICG pulse ends (ICG returns HIGH).
-   On Cortex-M, timer flags are cleared by writing 0 to the target bit.
-   The recommended idiom is to write the bitwise complement of the flag mask:
-   all bits stay 1 (writing 1 to a flag is a no-op), except CC2IF which
-   is set to 0 and therefore cleared.
+/* TIM2 CH2 compare match: fired when counter == CCR2 = end of ICG low pulse.
+   This is the exact moment the TCD1304 begins clocking pixels onto the OS pin.
+   Arm the ADC+DMA here for hardware-synchronised pixel capture.
+
+   Flag clearing on Cortex-M STM32 timers: write 0 to clear a flag bit;
+   writing 1 is a no-op. Use ~TIM_SR_CC2IF to clear only CC2IF, leaving
+   other bits (set by hardware) unmodified.
    TIMx_SR.CC2IF (bit 2) -- RM0383 §14.4.5 */
 void TIM2_IRQHandler(void)
 {
     if (TIM2->SR & TIM_SR_CC2IF) {
-        TIM2->SR = ~TIM_SR_CC2IF;   /* clear CC2IF (write 0; 1s elsewhere are no-ops) */
+        TIM2->SR = ~TIM_SR_CC2IF;   /* clear CC2IF */
+
+        /* Only re-arm if main loop has consumed the previous frame
+           (capture_done == 0). This prevents overwriting adc_buf while
+           the UART is still sending it.                               */
+        if (!capture_done) {
+            arm_capture();
+        }
     }
 }
 
-/* DMA2 Stream0 transfer complete - all PIXEL_COUNT samples moved to adc_buf.
-   Stop ADC and signal the main loop.
-   TCIF0  (bit 5 in DMA_LISR):  transfer-complete flag for stream 0.
-   CTCIF0 (bit 5 in DMA_LIFCR): write 1 to clear TCIF0.
-   DMA_LISR.TCIF0   -- RM0383 §9.5.1
-   DMA_LIFCR.CTCIF0 -- RM0383 §9.5.3 */
+/* DMA2 Stream0 transfer complete: all PIXEL_COUNT samples are in adc_buf.
+   Stop the ADC, issue a data-synchronisation barrier so the main loop
+   sees a fully coherent buffer, then signal completion.
+
+   TCIF0  (bit 5 in DMA_LISR)  -- RM0383 §9.5.1
+   CTCIF0 (bit 5 in DMA_LIFCR) -- RM0383 §9.5.3 */
 void DMA2_Stream0_IRQHandler(void)
 {
     if (DMA2->LISR & DMA_LISR_TCIF0) {
-        DMA2->LIFCR = DMA_LIFCR_CTCIF0;              /* clear TC flag             */
-        ADC1->CR2  &= ~(ADC_CR2_CONT | ADC_CR2_SWSTART); /* stop ADC conversions  */
-        DMA2_Stream0->CR &= ~DMA_SxCR_EN;            /* disable DMA stream        */
-        capture_done = 1;                             /* wake main loop            */
+        DMA2->LIFCR            = DMA_LIFCR_CTCIF0;
+        ADC1->CR2             &= ~(ADC_CR2_CONT | ADC_CR2_SWSTART);
+        DMA2_Stream0->CR      &= ~DMA_SxCR_EN;
+
+        /* DSB: ensure all DMA writes to adc_buf are visible to the CPU
+           before capture_done is written, preventing the main loop from
+           reading stale buffer contents.
+           ARM DSB -- Cortex-M4 Generic User Guide §2.2.7 */
+        __DSB();
+        capture_done = 1;
     }
 }
